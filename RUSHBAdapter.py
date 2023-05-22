@@ -93,6 +93,7 @@ class Adapter():
         self.adapter.sendto(discovery_packet, send_address)
 
         # receive offer
+        print(f'{self.adapter.getsockname()}')
         offer = self.adapter.recvfrom(PACKET_SIZE)
         offerMessage = offer[0]
         # offerMessage = offer[0].decode().rstrip('\x00')
@@ -169,10 +170,10 @@ class Adapter():
             self.recv_packets.append(message)
             
             # if mode == OFFER_02:
-            #     switch_ip = ipaddress.IPv4Address(message[:4]) 
+            #     switch_ip = ipaddress.IPv4Address(message[:4])
             #     self.switch_ips.append(switch_ip)
             #     self.ip = ipaddress.IPv4Address(int.from_bytes(message[12:16], byteorder='big'))
-
+            #
             #     # send request:
             #     request_packet = self.create_packet(REQUEST_03, dest_ip=str(switch_ip), data=str(self.ip))
             #     self.adapter.sendto(request_packet, send_address)
