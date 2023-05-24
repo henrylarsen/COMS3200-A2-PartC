@@ -1,7 +1,7 @@
 import socket
 import sys
 import threading
-import ipaddress
+import struct
 
 LOCAL_HOST = "127.0.0.1"
 BUFFER_SIZE = 1024
@@ -17,6 +17,7 @@ ASK_06 = 0x06
 DATA_05 = 0x05
 READY_07 = 0x07
 LOCATION_08 = 0x08
+DISTANCE_09 = 0x09
 FRAGMENT_0A = 0x0a
 FRAGMENT_END_0B = 0x0b
 
@@ -26,6 +27,8 @@ class Connection:
         self.type = type
         self.connection = connection
         self.address = LOCAL_HOST
+        self.distance = None
+        self.ip = None
         # If type is 'adapter' then connection is None
 
 
@@ -45,6 +48,7 @@ class RUSHBSwitch:
         self.udp_sock = None
         self.connections = []
         self.adapters = dict()
+        self.location = 0
 
         if self.switch_type == 'mixed':
             self.local_ip = local_ip.split('/')[0]
@@ -53,6 +57,7 @@ class RUSHBSwitch:
             self.global_cidr = global_ip.split('/')[1]
             self.max_local_connections = get_num_connections(self.local_cidr)
             self.max_global_connections = get_num_connections(self.global_cidr)
+            # self.num_connections = 0
             self.num_local_connections = 0
             self.num_global_connections = 0
         if self.switch_type == 'local':
@@ -145,7 +150,12 @@ class RUSHBSwitch:
                 packet, addr = self.udp_sock.recvfrom(PACKET_SIZE)
                 if addr not in self.adapters:
                     new_connection = Connection('adapter', addr)
+                    self.connections.append(new_connection)
                     self.adapters[addr] = new_connection
+                    if self.switch_type == 'mixed':
+                        self.num_local_connections = self.num_local_connections + 1
+                    else:
+                        self.num_connections = self.num_connections + 1
                     self.handle_packet(packet, new_connection)
                 else:
                     self.handle_packet(packet, self.adapters[addr])
@@ -161,6 +171,10 @@ class RUSHBSwitch:
             conn, addr = self.tcp_sock.accept()
             new_connection = Connection('local', conn)
             self.connections.append(new_connection)
+            if self.switch_type == 'mixed':
+                self.num_global_connections = self.num_global_connections + 1
+            else:
+                self.num_connections = self.num_connections + 1
             connection_thread = threading.Thread(target=self.handle_connection, args=(new_connection,))
             connection_thread.start()
 
@@ -216,15 +230,21 @@ class RUSHBSwitch:
         # append mode
         packet.append(mode)
 
-        try:
-            socket.inet_aton(data)
-        except socket.error:
-            for char in data:
-                packet.append(ord(char))
-        else:
-            # append assigned address
-            for elem in socket.inet_aton(data):
-                packet.append(elem)
+        if isinstance(data, str):
+            try:
+                socket.inet_aton(data)
+                # print(f'data1: {data}')
+            except socket.error:
+                for char in data:
+                    packet.append(ord(char))
+            else:
+                # append assigned address
+                for elem in socket.inet_aton(data):
+                    packet.append(elem)
+
+        elif isinstance(data, bytearray):
+            for byte in data:
+                packet.append(byte)
 
         self.send_packets.append(packet)
         return packet
@@ -254,6 +274,8 @@ class RUSHBSwitch:
             self.handle_ready(packet, connection)
         elif mode == LOCATION_08:
             self.handle_location(packet, connection)
+        elif mode == DISTANCE_09:
+            self.handle_distance(packet, connection)
         elif mode == FRAGMENT_0A:
             self.handle_fragment(packet, connection)
         elif mode == FRAGMENT_END_0B:
@@ -268,10 +290,21 @@ class RUSHBSwitch:
         source_ip = self.global_ip if self.switch_type == 'mixed' else self.ip
 
         # TODO: add implementation for mixed switches
-        if self.num_connections == self.max_connections:
+        if self.switch_type == 'mixed':
+            if self.num_global_connections == self.max_global_connections or \
+                    self.num_local_connections == self.max_local_connections:
+                return
+        elif self.num_connections == self.max_connections:
             return
+
+        if self.switch_type == "mixed":
+            if connection.type == "local" or "adapter":
+                offer_ip = self.get_next_ip(self.local_ip, 'local')
+            else:
+                offer_ip = self.get_next_ip(self.global_ip, 'global')
         else:
-            offer_ip = self.get_next_ip()
+            offer_ip = self.get_next_ip(self.ip)
+        connection.ip = offer_ip
         offer_packet = self.create_packet(OFFER_02, source_ip, '0.0.0.0', offer_ip)
 
         if connection.type == 'adapter':
@@ -281,10 +314,16 @@ class RUSHBSwitch:
             connection.connection.send(offer_packet)
             print('tcp sent')
 
-    def get_next_ip(self):
-        ip_parts = self.ip.split('.')
+    def get_next_ip(self, ip, s_type=None):
+        ip_parts = ip.split('.')
         # TODO: If host IP ends with 10, will this work? the last byte will exceed 255, won't loop back to .1
-        ip_parts[-1] = str(int(ip_parts[-1]) + self.num_connections + 1)
+        if s_type is None:
+            ip_parts[-1] = str(int(ip_parts[-1]) + self.num_connections)
+        else:
+            if s_type == 'global':
+                ip_parts[-1] = str(int(ip_parts[-1]) + self.num_global_connections)
+            elif s_type == 'local':
+                ip_parts[-1] = str(int(ip_parts[-1]) + self.num_local_connections)
 
         return '.'.join(ip_parts)
 
@@ -294,6 +333,7 @@ class RUSHBSwitch:
         source_ip = socket.inet_ntoa(packet[:4])
         # Extract assigned address if it is an IP address (4 bytes)
         data = socket.inet_ntoa(packet[12:16])
+        connection.ip = data
 
         request_packet = self.create_packet(REQUEST_03, '0.0.0.0', source_ip, data)
         connection.connection.send(request_packet)
@@ -315,9 +355,23 @@ class RUSHBSwitch:
             connection.connection.send(acknowledge_packet)
             print('tcp sent')
 
-    def handle_acknowledge(self, packet, address):
+    def handle_acknowledge(self, packet, connection):
         # Handle an Acknowledge packet
-        print(f"Acknowledge packet received from {address}")
+        source_ip = socket.inet_ntoa(packet[12:16])
+        destination_ip = socket.inet_ntoa(packet[:4])
+
+        data = bytearray()
+        latitude_bytes = self.latitude.to_bytes(2, 'big')
+        for byte in latitude_bytes:
+            data.append(byte)
+        longitude_bytes = self.longitude.to_bytes(2, 'big')
+        for byte in longitude_bytes:
+            data.append(byte)
+
+        location_packet = self.create_packet(LOCATION_08, source_ip, destination_ip, data)
+        connection.connection.send(location_packet)
+        print(f"Acknowledge packet received from {connection.connection}")
+        self.location = 1
 
     def handle_data(self, packet, address):
         # Handle a Data packet
@@ -331,13 +385,60 @@ class RUSHBSwitch:
         # Handle a Ready packet
         print(f"Ready packet received from {address}")
 
-    def handle_location(self, packet, address):
+    def handle_location(self, packet, connection):
         # Handle a Location packet
-        print(f"Location packet received from {address}")
+        # Send all connecting package but connection the length
+        sent_latitude = int.from_bytes(packet[12:14], byteorder='big')
+        sent_longitude = int.from_bytes(packet[14:16], byteorder='big')
+        distance = self.calculate_euclidean_distance(sent_latitude, sent_longitude)
+        connection.distance = distance
+        print(f'self.connections: {self.connections}')
+        for conn in self.connections:
+            print(f'connection: {conn}')
+            if conn == connection:
+                pass
+            else:
+                source_ip = socket.inet_ntoa(packet[4:8])
+                destination_ip = connection.ip
+                assigned_ip = packet[:4]
+                total_distance = (distance + conn.distance).to_bytes(4, 'big')
+                data = bytearray()
+                for elem in assigned_ip:
+                    data.append(elem)
+                for byte in total_distance:
+                    data.append(byte)
+                distance_packet = self.create_packet(DISTANCE_09, source_ip, destination_ip, data)
+                conn.connection.send(distance_packet)
 
-    def handle_distance(self, packet, address):
+        # Send the response location packet if haven't already
+        if self.location == 1:
+            self.location = 0
+            return
+
+        self.location = 1
+        source_ip = socket.inet_ntoa(packet[4:8])
+        destination_ip = socket.inet_ntoa(packet[:4])
+
+        data = bytearray()
+        latitude_bytes = self.latitude.to_bytes(2, 'big')
+        for byte in latitude_bytes:
+            print(byte)
+            data.append(byte)
+        longitude_bytes = self.longitude.to_bytes(2, 'big')
+        # print(list(longitude_bytes))
+        for byte in longitude_bytes:
+            print(byte)
+            data.append(byte)
+
+        print(f'data: {data}')
+        location_packet = self.create_packet(LOCATION_08, source_ip, destination_ip, data)
+        connection.connection.send(location_packet)
+
+        print(f"Location packet received from {connection.connection}")
+
+    def handle_distance(self, packet, connection):
         # Handle a Distance packet
-        print(f"Distance packet received from {address}")
+        print(f"Distance packet received from {connection}")
 
     def handle_more_fragments(self, packet, address):
         # Handle a More Fragments packet
@@ -347,9 +448,12 @@ class RUSHBSwitch:
         # Handle a Last Fragment packet
         print(f"Last Fragment packet received from {address}")
 
+    def calculate_euclidean_distance(self, sent_latitude, sent_longitude):
+        return int(((self.latitude - sent_latitude)**2 + (self.longitude - sent_longitude)**2) ** (1/2))
+
 
 # Easy test: local
-# switch = RUSHBSwitch("local", "192.168.0.1/24", None, 50, 20)
+# switch = RUSHBSwitch("local", "192.168.1.1/24", None, 1234, 4567)
 
 # Easy test: mixed
 # switch = RUSHBSwitch('mixed', '192.168.0.1/24', '130.102.72.10/24', 50, 20)
@@ -361,43 +465,80 @@ class RUSHBSwitch:
 
 
 # TODO: change how mixed is formatted when run from console
-# Run from console
+# Run from console (to spec)
+# if __name__ == "__main__":
+#     if len(sys.argv) < 5:
+#         print("Invalid number of arguments.")
+#         sys.exit(1)
+#
+#     switch_type = sys.argv[1]
+#     ip_address = sys.argv[2]
+#     latitude = int(sys.argv[3])
+#     longitude = int(sys.argv[4])
+#     local_ip_address = None
+#     global_ip_address = None
+#
+#     if switch_type == 'local' and len(sys.argv) == 6:
+#         switch_type = 'mixed'
+#
+#     if switch_type == 'local':
+#         if len(sys.argv) != 5:
+#             print("Invalid number of arguments.")
+#             sys.exit(1)
+#         local_ip_address = ip_address
+#     elif switch_type == 'global':
+#         if len(sys.argv) != 5:
+#             print("Invalid number of arguments.")
+#             sys.exit(1)
+#         global_ip_address = ip_address
+#     elif switch_type == 'mixed':
+#         if len(sys.argv) != 6:
+#             print("Invalid number of arguments.")
+#             sys.exit(1)
+#         local_ip_address = ip_address
+#         global_ip_address = sys.argv[5]
+#
+#     else:
+#         print("Invalid switch type.")
+#         sys.exit(1)
+#
+#     switch = RUSHBSwitch(switch_type, local_ip_address, global_ip_address, latitude, longitude)
+#     switch.start()
+
+# Run from console (to tests)
 if __name__ == "__main__":
     if len(sys.argv) < 5:
         print("Invalid number of arguments.")
         sys.exit(1)
 
-    switch_type = sys.argv[1]
-    ip_address = sys.argv[2]
-    latitude = int(sys.argv[3])
-    longitude = int(sys.argv[4])
-    global_ip_address = None
-
-    if switch_type == 'local' and len(sys.argv) == 6:
-        switch_type == 'mixed'
-
-    if switch_type == 'local':
-        if len(sys.argv) != 5:
-            print("Invalid number of arguments.")
-            sys.exit(1)
-    elif switch_type == 'global':
-        if len(sys.argv) != 5:
-            print("Invalid number of arguments.")
-            sys.exit(1)
-        global_ip_address = ip_address
-    elif switch_type == 'mixed':
-        if len(sys.argv) != 6:
-            print("Invalid number of arguments.")
-            sys.exit(1)
+    if len(sys.argv) == 6:
+        switch_type = "mixed"
+        local_ip_address = sys.argv[2]
         global_ip_address = sys.argv[3]
         latitude = int(sys.argv[4])
         longitude = int(sys.argv[5])
+
+    elif len(sys.argv) == 5:
+        switch_type = sys.argv[1]
+        if switch_type == 'local':
+            local_ip_address = sys.argv[2]
+            global_ip_address = None
+        elif switch_type == 'global':
+            global_ip_address = sys.argv[2]
+            local_ip_address = None
+        else:
+            print("Invalid switch type.")
+            sys.exit(1)
+        latitude = int(sys.argv[3])
+        longitude = int(sys.argv[4])
+
     else:
-        print("Invalid switch type.")
+        print("Invalid number of arguments.")
         sys.exit(1)
 
-    switch = RUSHBSwitch(switch_type, ip_address, latitude, longitude, global_ip_address)
+    switch = RUSHBSwitch(switch_type, local_ip_address, global_ip_address, latitude, longitude)
     switch.start()
+
 
 def extract_packet(packet):
     # Extract source IP address (4 bytes)
