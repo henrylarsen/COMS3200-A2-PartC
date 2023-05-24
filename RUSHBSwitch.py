@@ -392,9 +392,7 @@ class RUSHBSwitch:
         sent_longitude = int.from_bytes(packet[14:16], byteorder='big')
         distance = self.calculate_euclidean_distance(sent_latitude, sent_longitude)
         connection.distance = distance
-        print(f'self.connections: {self.connections}')
         for conn in self.connections:
-            print(f'connection: {conn}')
             if conn == connection:
                 pass
             else:
