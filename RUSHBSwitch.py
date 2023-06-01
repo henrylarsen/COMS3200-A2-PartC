@@ -13,8 +13,8 @@ DISCOVERY_01 = 0x01
 OFFER_02 = 0x02
 REQUEST_03 = 0x03
 ACK_04 = 0x04
-ASK_06 = 0x06
 DATA_05 = 0x05
+ASK_06 = 0x06
 READY_07 = 0x07
 LOCATION_08 = 0x08
 DISTANCE_09 = 0x09
@@ -23,17 +23,31 @@ FRAGMENT_END_0B = 0x0b
 
 
 class Connection:
-    def __init__(self, type, connection):
+    def __init__(self, type, connection, addr=None):
         self.type = type
         self.connection = connection
         self.address = LOCAL_HOST
         self.distance = None
         self.ip = None
+        self.self_assigned_ip = None
+        self.addr = addr
         # If type is 'adapter' then connection is None
 
 
 def get_num_connections(cidr):
-    return (2**(32-int(cidr))) - 2
+    return (2 ** (32 - int(cidr))) - 2
+
+
+def matched_ip(ip, destination_ip):
+    count = 0
+    print(f'matched_ip: {ip}, {destination_ip}')
+    for char1, char2 in zip(ip, destination_ip):
+        if char1 == char2:
+            count += 1
+        else:
+            break
+    print(f'count: {count}')
+    return count
 
 
 class RUSHBSwitch:
@@ -49,11 +63,15 @@ class RUSHBSwitch:
         self.connections = []
         self.adapters = dict()
         self.location = 0
+        # Dict with key as the neighbours neighbour, and value as a tuple with neighbour [0] and distance [1]
+        self.neighbours_neighbour = dict()
+        # self.switch_ready = None
+        self.waiting_packet = dict()
 
         if self.switch_type == 'mixed':
             self.local_ip = local_ip.split('/')[0]
             self.global_ip = global_ip.split('/')[0]
-            self.local_cidr =  local_ip.split('/')[1]
+            self.local_cidr = local_ip.split('/')[1]
             self.global_cidr = global_ip.split('/')[1]
             self.max_local_connections = get_num_connections(self.local_cidr)
             self.max_global_connections = get_num_connections(self.global_cidr)
@@ -149,6 +167,7 @@ class RUSHBSwitch:
             try:
                 packet, addr = self.udp_sock.recvfrom(PACKET_SIZE)
                 if addr not in self.adapters:
+                    print(f'addr: {addr}')
                     new_connection = Connection('adapter', addr)
                     self.connections.append(new_connection)
                     self.adapters[addr] = new_connection
@@ -169,7 +188,7 @@ class RUSHBSwitch:
     def tcp_listener(self):
         try:
             conn, addr = self.tcp_sock.accept()
-            new_connection = Connection('local', conn)
+            new_connection = Connection('local', conn, addr=addr)
             self.connections.append(new_connection)
             if self.switch_type == 'mixed':
                 self.num_global_connections = self.num_global_connections + 1
@@ -194,6 +213,7 @@ class RUSHBSwitch:
         client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client_socket = Connection('local', client_sock)
         self.connections.append(client_socket)
+        print(f'CHEEKEKEKCK: {client_socket}')
         client_socket.connection.connect((LOCAL_HOST, connect_port))
 
         # send discovery
@@ -252,7 +272,6 @@ class RUSHBSwitch:
     def handle_packet(self, packet, connection):
         # Handle a received packet
         # Extract mode (1 byte)
-        print(f'packet: {packet}')
         mode = packet[11]
         # print(f'Check mode: {mode}')
         # print out the packet contents
@@ -287,7 +306,14 @@ class RUSHBSwitch:
         # Handle a Discovery packet
         # print(f"Discovery packet received from {connection.address}. \n Source IP: {socket.inet_ntoa(packet[:4])} "
         #       f"\n Destination IP: {socket.inet_ntoa(packet[4:8])} \n Mode: {packet[11]}")
-        source_ip = self.global_ip if self.switch_type == 'mixed' else self.ip
+
+        if self.switch_type == 'mixed':
+            if connection.type == 'adapter':
+                source_ip = self.local_ip
+            else:
+                source_ip = self.global_ip
+        else:
+            source_ip = self.ip
 
         # TODO: add implementation for mixed switches
         if self.switch_type == 'mixed':
@@ -298,7 +324,7 @@ class RUSHBSwitch:
             return
 
         if self.switch_type == "mixed":
-            if connection.type == "local" or "adapter":
+            if connection.type == "adapter":
                 offer_ip = self.get_next_ip(self.local_ip, 'local')
             else:
                 offer_ip = self.get_next_ip(self.global_ip, 'global')
@@ -308,11 +334,10 @@ class RUSHBSwitch:
         offer_packet = self.create_packet(OFFER_02, source_ip, '0.0.0.0', offer_ip)
 
         if connection.type == 'adapter':
+            self.adapters[(offer_ip, connection.connection[1])] = connection
             self.udp_sock.sendto(offer_packet, connection.connection)
-            print('udp sent')
         else:
             connection.connection.send(offer_packet)
-            print('tcp sent')
 
     def get_next_ip(self, ip, s_type=None):
         ip_parts = ip.split('.')
@@ -331,9 +356,10 @@ class RUSHBSwitch:
         # Handle an Offer packet
         # Extract source IP address (4 bytes), use this as destination IP in packet
         source_ip = socket.inet_ntoa(packet[:4])
+        connection.ip = source_ip
         # Extract assigned address if it is an IP address (4 bytes)
         data = socket.inet_ntoa(packet[12:16])
-        connection.ip = data
+        connection.self_assigned_ip = data
 
         request_packet = self.create_packet(REQUEST_03, '0.0.0.0', source_ip, data)
         connection.connection.send(request_packet)
@@ -341,7 +367,13 @@ class RUSHBSwitch:
 
     def handle_request(self, packet, connection):
         # Handle a Request packet
-        source_ip = self.global_ip if self.switch_type == 'mixed' else self.ip
+        if self.switch_type == 'mixed':
+            if connection.type == 'adapter':
+                source_ip = self.local_ip
+            else:
+                source_ip = self.global_ip
+        else:
+            source_ip = self.ip
         # print(f"Request packet received from {connection}")
         # Extract assigned address if it is an IP address (4 bytes), use as data and destination_ip
         data = socket.inet_ntoa(packet[12:16])
@@ -350,10 +382,8 @@ class RUSHBSwitch:
 
         if connection.type == 'adapter':
             self.udp_sock.sendto(acknowledge_packet, connection.connection)
-            print('udp sent')
         else:
             connection.connection.send(acknowledge_packet)
-            print('tcp sent')
 
     def handle_acknowledge(self, packet, connection):
         # Handle an Acknowledge packet
@@ -369,37 +399,125 @@ class RUSHBSwitch:
             data.append(byte)
 
         location_packet = self.create_packet(LOCATION_08, source_ip, destination_ip, data)
+        for conn in self.connections:
+            print(f'AHH: {conn}')
+        print(f'AHH?: {connection}')
+        print(f'AHHH!: {connection.connection}')
+        print(f'AHHH::: {conn.connection}')
+
         connection.connection.send(location_packet)
         print(f"Acknowledge packet received from {connection.connection}")
         self.location = 1
 
-    def handle_data(self, packet, address):
+    def handle_data(self, packet, connection):
         # Handle a Data packet
-        print(f"Data packet received from {address}")
+        self.waiting_packet[connection] = packet
+        destination_ip = socket.inet_ntoa(packet[4:8])
+        # If adapter is connected, send query first
+        print(connection.type)
 
-    def handle_query(self, packet, address):
+        inside = False
+        for conn in self.connections:
+            if conn.ip == destination_ip:
+                inside = True
+
+        if inside:
+            for conn in self.connections:
+                if conn.ip == destination_ip:
+                    if self.switch_ready == destination_ip:
+                        if conn.type == 'adapter':
+                            self.udp_sock.sendto(packet, conn.connection)
+                        else:
+                            conn.connection.send(packet)
+                    else:
+                        self.query(conn, packet)
+
+            # If aware of the adapter
+        elif destination_ip in self.neighbours_neighbour:
+            send_to = self.neighbours_neighbour[destination_ip][0]
+            for conn in self.connections:
+                if conn.ip == send_to:
+                    self.query(conn, packet)
+
+        # TODO: didn't implement option 3 in Data Forwarding (Don't understand it)
+        else:
+            current_highest = (self.connections[0], matched_ip(self.connections[0].ip, destination_ip))
+            for conn in self.connections:
+                current_conn = matched_ip(conn.ip, destination_ip)
+                if current_conn > current_highest[1]:
+                    current_highest = (conn, current_conn)
+                print(current_highest[0].ip)
+            self.query(current_highest[0], packet)
+
+            # current_highest[0].connection.send(packet)
+
+        print(f"Data packet received from {connection}")
+
+    def handle_query(self, packet, connection):
         # Handle a Query packet
-        print(f"Query packet received from {address}")
+        print(f"Query packet received from {connection}")
 
-    def handle_ready(self, packet, address):
+    def handle_ready(self, packet, connection):
         # Handle a Ready packet
-        print(f"Ready packet received from {address}")
+        source_ip = socket.inet_ntoa(packet[:4])
+        print(f'setting self.switch_ready to: {source_ip}')
+
+        if connection.type == 'adapter':
+            self.udp_sock.sendto(self.waiting_packet[connection], connection.connection)
+        else:
+            connection.connection.send(self.waiting_packet[connection])
+        # self.switch_ready = None
+        # self.switch_ready = source_ip
+        print(f"Ready packet received from {connection}")
 
     def handle_location(self, packet, connection):
         # Handle a Location packet
-        # Send all connecting package but connection the length
+
+        # Send the response location packet if haven't already
+        if self.location == 1:
+            self.location = 0
+        else:
+            self.location = 1
+            source_ip = socket.inet_ntoa(packet[4:8])
+            destination_ip = socket.inet_ntoa(packet[:4])
+
+            data = bytearray()
+            latitude_bytes = self.latitude.to_bytes(2, 'big')
+            for byte in latitude_bytes:
+                print(byte)
+                data.append(byte)
+            longitude_bytes = self.longitude.to_bytes(2, 'big')
+            # print(list(longitude_bytes))
+            for byte in longitude_bytes:
+                print(byte)
+                data.append(byte)
+
+            location_packet = self.create_packet(LOCATION_08, source_ip, destination_ip, data)
+            connection.connection.send(location_packet)
+
+        # Send all connecting package but connection the distance
         sent_latitude = int.from_bytes(packet[12:14], byteorder='big')
         sent_longitude = int.from_bytes(packet[14:16], byteorder='big')
         distance = self.calculate_euclidean_distance(sent_latitude, sent_longitude)
         connection.distance = distance
+
         for conn in self.connections:
-            if conn == connection:
+            if (conn == connection and self.switch_type != 'mixed') or conn.type == 'adapter':
                 pass
             else:
-                source_ip = socket.inet_ntoa(packet[4:8])
-                destination_ip = connection.ip
-                assigned_ip = packet[:4]
-                total_distance = (distance + conn.distance).to_bytes(4, 'big')
+                if conn.self_assigned_ip is not None:
+                    source_ip = conn.self_assigned_ip
+                else:
+                    source_ip = socket.inet_ntoa(packet[4:8])
+                destination_ip = conn.ip
+                if conn == connection and self.switch_type == 'mixed':
+                    assigned_ip = self.local_ip
+                    assigned_ip = socket.inet_aton(assigned_ip)
+                    total_distance = distance.to_bytes(4, 'big')
+                else:
+                    assigned_ip = packet[:4]
+                    total_distance = (distance + conn.distance).to_bytes(4, 'big')
+                # assigned_ip = packet[:4]
                 data = bytearray()
                 for elem in assigned_ip:
                     data.append(elem)
@@ -408,46 +526,57 @@ class RUSHBSwitch:
                 distance_packet = self.create_packet(DISTANCE_09, source_ip, destination_ip, data)
                 conn.connection.send(distance_packet)
 
-        # Send the response location packet if haven't already
-        if self.location == 1:
-            self.location = 0
-            return
-
-        self.location = 1
-        source_ip = socket.inet_ntoa(packet[4:8])
-        destination_ip = socket.inet_ntoa(packet[:4])
-
-        data = bytearray()
-        latitude_bytes = self.latitude.to_bytes(2, 'big')
-        for byte in latitude_bytes:
-            print(byte)
-            data.append(byte)
-        longitude_bytes = self.longitude.to_bytes(2, 'big')
-        # print(list(longitude_bytes))
-        for byte in longitude_bytes:
-            print(byte)
-            data.append(byte)
-
-        print(f'data: {data}')
-        location_packet = self.create_packet(LOCATION_08, source_ip, destination_ip, data)
-        connection.connection.send(location_packet)
-
         print(f"Location packet received from {connection.connection}")
 
     def handle_distance(self, packet, connection):
         # Handle a Distance packet
+        neighbour = socket.inet_ntoa(packet[:4])
+        neighbours_neighbour = socket.inet_ntoa(packet[12:16])
+        distance = int.from_bytes(packet[16:20], byteorder='big')
+        if neighbours_neighbour in self.neighbours_neighbour:
+            if self.neighbours_neighbour[neighbours_neighbour][1] > distance:
+                self.neighbours_neighbour[neighbours_neighbour] = (neighbour, distance)
+                # TODO: implement sending the other attached neighbours another distance packet
+                # for conn in self.connections:
+                #     if conn != connection and conn.type != 'adapter':
+        else:
+            self.neighbours_neighbour[neighbours_neighbour] = (neighbour, distance)
+
         print(f"Distance packet received from {connection}")
 
-    def handle_more_fragments(self, packet, address):
+    def handle_more_fragments(self, packet, connection):
         # Handle a More Fragments packet
-        print(f"More Fragments packet received from {address}")
+        print(f"More Fragments packet received from {connection}")
 
-    def handle_last_fragment(self, packet, address):
+    def handle_last_fragment(self, packet, connection):
         # Handle a Last Fragment packet
-        print(f"Last Fragment packet received from {address}")
+        print(f"Last Fragment packet received from {connection}")
 
     def calculate_euclidean_distance(self, sent_latitude, sent_longitude):
-        return int(((self.latitude - sent_latitude)**2 + (self.longitude - sent_longitude)**2) ** (1/2))
+        return int(((self.latitude - sent_latitude) ** 2 + (self.longitude - sent_longitude) ** 2) ** (1 / 2))
+
+    def query(self, conn, packet):
+        if conn.self_assigned_ip is not None:
+            source_ip = conn.self_assigned_ip
+        elif self.switch_type == 'mixed':
+            if conn.type == 'adapter':
+                source_ip = self.local_ip
+            else:
+                source_ip = self.global_ip
+        else:
+            source_ip = self.ip
+
+        data = bytearray()
+        query_packet = self.create_packet(ASK_06, source_ip, conn.ip, data)
+        if conn.type == 'adapter':
+            self.udp_sock.sendto(query_packet, conn.connection)
+        else:
+            conn.connection.send(packet)
+            print(f'check21: {conn}')
+            print(f'check22: {conn.ip}')
+            print(f'check23: {conn.connection}')
+
+
 
 
 # Easy test: local
